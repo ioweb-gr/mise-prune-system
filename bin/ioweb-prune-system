@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,6 +23,27 @@ class Install:
 
 class PruneError(Exception):
     pass
+
+
+VERSION_RE = re.compile(
+    r"^v?(?P<release>\d+(?:\.\d+)*)(?:-(?P<prerelease>[0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def version_key(version: str) -> tuple[tuple[int, ...], int, tuple[tuple[int, object], ...]] | None:
+    """Sort common numeric tool versions safely; return None for unknown schemes."""
+    match = VERSION_RE.fullmatch(version)
+    if not match:
+        return None
+    release = tuple(int(part) for part in match.group("release").split("."))
+    prerelease = match.group("prerelease")
+    if prerelease is None:
+        return release, 1, ()
+    identifiers = tuple(
+        (0, int(part)) if part.isdigit() else (1, part.lower())
+        for part in prerelease.split(".")
+    )
+    return release, 0, identifiers
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,6 +216,26 @@ def find_installs(
     installs_dir: pathlib.Path, data: dict[str, list[dict[str, object]]], process_refs: set[pathlib.Path],
 ) -> list[Install]:
     found: dict[pathlib.Path, Install] = {}
+    newest_by_tool: dict[str, tuple[tuple[int, ...], int, tuple[tuple[int, object], ...]]] = {}
+    unordered_paths: set[pathlib.Path] = set()
+    for tool, rows in data.items():
+        for row in rows:
+            if row.get("installed") is not True:
+                continue
+            raw_path = row.get("install_path")
+            version = row.get("version")
+            if not isinstance(raw_path, str) or not isinstance(version, str):
+                continue
+            path = pathlib.Path(raw_path).absolute()
+            if not within(path, installs_dir) or path.is_symlink() or not path.is_dir():
+                continue
+            key = version_key(version)
+            if key is None:
+                unordered_paths.add(path)
+                continue
+            if tool not in newest_by_tool or key > newest_by_tool[tool]:
+                newest_by_tool[tool] = key
+
     for tool, rows in data.items():
         for row in rows:
             if row.get("installed") is not True:
@@ -215,6 +257,13 @@ def find_installs(
                 reasons.append("active in current mise environment")
             if references_path(process_refs, path):
                 reasons.append("referenced by a running process")
+            key = version_key(version)
+            if key is None:
+                reasons.append("version format cannot be safely compared")
+            elif key == newest_by_tool.get(tool):
+                reasons.append("newest numeric system version for tool")
+            if path in unordered_paths:
+                reasons.append("version format cannot be safely compared")
             existing = found.get(path)
             if existing:
                 reasons = sorted(set(existing.reasons_kept).union(reasons))

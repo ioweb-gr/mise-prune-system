@@ -38,6 +38,8 @@ uses a non-default location. The installs directory is `<system-data-dir>/instal
 
 - Only installed versions whose reported install path is inside the selected
   system installs directory are considered.
+- The newest safely comparable numeric version for each tool is kept. Versions
+  using an unknown format are kept because their order cannot be established.
 - Versions associated with tracked config sources, active in the current mise
   environment, or referenced by a running process are kept.
 - If mise output is invalid, a candidate path is ambiguous, or process
