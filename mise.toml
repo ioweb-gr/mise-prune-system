@@ -1,0 +1,3 @@
+[tasks.ioweb-prune-system]
+description = "Preview or remove unused mise system installs"
+run = "python3 bin/ioweb-prune-system"

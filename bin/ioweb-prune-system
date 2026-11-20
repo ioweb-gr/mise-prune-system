@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Safely preview and remove unused versions in mise's system install root."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Install:
+    tool: str
+    version: str
+    path: pathlib.Path
+    reasons_kept: tuple[str, ...]
+
+
+class PruneError(Exception):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Preview or remove unused versions in mise system installs."
+    )
+    parser.add_argument(
+        "--system-data-dir",
+        type=pathlib.Path,
+        default=pathlib.Path(os.environ.get("MISE_SYSTEM_DATA_DIR", "/usr/local/share/mise")),
+        help="mise system data directory (default: MISE_SYSTEM_DATA_DIR or /usr/local/share/mise)",
+    )
+    parser.add_argument(
+        "--mise",
+        default=os.environ.get("MISE_BIN", "mise"),
+        help="mise executable (default: MISE_BIN or mise)",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="remove candidates after confirmation")
+    mode.add_argument("--dry-run", action="store_true", help="show candidates only (default)")
+    parser.add_argument("--yes", action="store_true", help="skip confirmation; requires --apply")
+    args = parser.parse_args()
+    if args.yes and not args.apply:
+        parser.error("--yes requires --apply")
+    return args
+
+
+def run_mise(mise: str, args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [mise, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except OSError as exc:
+        raise PruneError(f"could not run {mise!r}: {exc}") from exc
+
+
+def list_installs(mise: str) -> dict[str, list[dict[str, object]]]:
+    result = run_mise(mise, ["ls", "--all-sources", "--json"])
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise PruneError(f"mise ls failed with exit code {result.returncode}: {detail}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise PruneError(f"mise ls returned invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PruneError("mise ls JSON was not an object keyed by tool")
+    normalized: dict[str, list[dict[str, object]]] = {}
+    for tool, rows in data.items():
+        if not isinstance(tool, str) or not isinstance(rows, list):
+            raise PruneError("mise ls JSON contained an unexpected tool entry")
+        normalized[tool] = [row for row in rows if isinstance(row, dict)]
+        if len(normalized[tool]) != len(rows):
+            raise PruneError(f"mise ls JSON contained a malformed row for {tool}")
+    return normalized
+
+
+def within(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def process_references(root: pathlib.Path) -> tuple[set[pathlib.Path], bool]:
+    """Return install paths referenced by live Linux processes and scan completeness."""
+    proc = pathlib.Path("/proc")
+    if not proc.is_dir():
+        return set(), False
+    referenced: set[pathlib.Path] = set()
+    complete = True
+    root_bytes = os.fsencode(str(root) + os.sep)
+    root_text = str(root) + os.sep
+
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = entry.name
+        for name in ("exe", "cwd"):
+            try:
+                target = pathlib.Path(os.readlink(entry / name))
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                complete = False
+                continue
+            if within(target, root):
+                referenced.add(target)
+
+        for name in ("cmdline", "maps"):
+            try:
+                content = (entry / name).read_bytes()
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                complete = False
+                continue
+            if root_bytes in content:
+                for token in content.replace(b"\x00", b" ").split():
+                    try:
+                        value = os.fsdecode(token)
+                    except UnicodeDecodeError:
+                        continue
+                    if value.startswith(root_text):
+                        referenced.add(pathlib.Path(value))
+
+        fds = entry / "fd"
+        try:
+            fd_entries = list(fds.iterdir())
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            complete = False
+            continue
+        for fd in fd_entries:
+            try:
+                target = pathlib.Path(os.readlink(fd))
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                complete = False
+                continue
+            if within(target, root):
+                referenced.add(target)
+    return referenced, complete
+
+
+def references_path(references: set[pathlib.Path], install: pathlib.Path) -> bool:
+    return any(within(ref, install) for ref in references)
+
+
+def find_installs(
+    installs_dir: pathlib.Path, data: dict[str, list[dict[str, object]]], process_refs: set[pathlib.Path],
+) -> list[Install]:
+    found: dict[pathlib.Path, Install] = {}
+    for tool, rows in data.items():
+        for row in rows:
+            if row.get("installed") is not True:
+                continue
+            raw_path = row.get("install_path")
+            version = row.get("version")
+            if not isinstance(raw_path, str) or not isinstance(version, str):
+                raise PruneError(f"mise ls omitted install_path/version for installed {tool}")
+            path = pathlib.Path(raw_path).absolute()
+            if not within(path, installs_dir):
+                continue
+            if path.is_symlink() or not path.is_dir():
+                continue
+            sources = row.get("sources")
+            reasons: list[str] = []
+            if isinstance(sources, list) and sources:
+                reasons.append("referenced by tracked configuration")
+            if row.get("active") is True:
+                reasons.append("active in current mise environment")
+            if references_path(process_refs, path):
+                reasons.append("referenced by a running process")
+            existing = found.get(path)
+            if existing:
+                reasons = sorted(set(existing.reasons_kept).union(reasons))
+            found[path] = Install(tool, version, path, tuple(reasons))
+    return sorted(found.values(), key=lambda item: (item.tool, item.version, str(item.path)))
+
+
+def display(installs: list[Install]) -> None:
+    if not installs:
+        print("No installed system versions found.")
+        return
+    width = max(len(item.tool) for item in installs)
+    for item in installs:
+        state = "KEEP: " + ", ".join(item.reasons_kept) if item.reasons_kept else "PRUNE"
+        print(f"{state:48} {item.tool:<{width}} {item.version}  {item.path}")
+
+
+def uninstall_one(mise: str, item: Install, installs_dir: pathlib.Path) -> None:
+    env = os.environ.copy()
+    env["MISE_INSTALLS_DIR"] = str(installs_dir)
+    where = run_mise(mise, ["where", f"{item.tool}@{item.version}"], env)
+    if where.returncode:
+        raise PruneError(
+            f"mise where failed for {item.tool}@{item.version}: {where.stderr.strip()}"
+        )
+    try:
+        selected_path = pathlib.Path(where.stdout.strip()).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PruneError(f"could not resolve mise's selected install for {item.tool}@{item.version}") from exc
+    if selected_path != item.path.resolve(strict=True):
+        raise PruneError(
+            f"mise resolves {item.tool}@{item.version} to {selected_path}, "
+            f"not the reviewed candidate {item.path}"
+        )
+    result = run_mise(mise, ["uninstall", f"{item.tool}@{item.version}"], env)
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+    if result.returncode:
+        raise PruneError(
+            f"mise uninstall failed for {item.tool}@{item.version} with exit code {result.returncode}"
+        )
+
+
+def main() -> int:
+    args = parse_args()
+    if sys.platform != "linux":
+        print("This first version supports Linux process checks only; no changes made.", file=sys.stderr)
+        return 2
+    if args.apply and os.geteuid() != 0:
+        print("Run with root privileges to apply system install removals.", file=sys.stderr)
+        return 2
+
+    data_root = args.system_data_dir.expanduser().absolute()
+    installs_dir = (data_root / "installs").resolve()
+    if not installs_dir.is_dir():
+        print(f"System installs directory does not exist: {installs_dir}")
+        return 0
+
+    try:
+        data = list_installs(args.mise)
+        process_refs, complete = process_references(installs_dir)
+        if not complete and args.apply:
+            raise PruneError("could not inspect every process; refusing to apply removals")
+        installs = find_installs(installs_dir, data, process_refs)
+        if not complete:
+            installs = [
+                Install(x.tool, x.version, x.path, x.reasons_kept or ("process scan incomplete",))
+                for x in installs
+            ]
+        display(installs)
+        candidates = [item for item in installs if not item.reasons_kept]
+        if not args.apply:
+            print(f"\nPreview only: {len(candidates)} candidate(s). Re-run with --apply to remove after confirmation.")
+            return 0
+        if not candidates:
+            print("Nothing to remove.")
+            return 0
+
+        if not args.yes:
+            answer = input(f"Type 'prune' to uninstall these {len(candidates)} system version(s): ")
+            if answer.strip() != "prune":
+                print("Cancelled.")
+                return 1
+
+        for item in candidates:
+            # Refresh config and process references immediately before each removal.
+            latest_data = list_installs(args.mise)
+            latest_refs, latest_complete = process_references(installs_dir)
+            if not latest_complete:
+                raise PruneError("process scan became incomplete; stopping before the next removal")
+            latest = find_installs(installs_dir, latest_data, latest_refs)
+            current = next((x for x in latest if x.path == item.path), None)
+            if current is None or current.reasons_kept:
+                print(f"Keeping {item.path}: new reference or install state detected.")
+                continue
+            uninstall_one(args.mise, current, installs_dir)
+        return 0
+    except (PruneError, OSError) as exc:
+        print(f"ioweb-prune-system: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
