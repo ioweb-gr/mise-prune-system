@@ -5,9 +5,9 @@ system-wide installs directory. It is intended as a temporary companion to
 mise's built-in `mise prune`, which does not currently prune shared/system
 install roots.
 
-The helper is deliberately Linux-only for now. It uses mise's tracked
-configuration sources to protect referenced versions, checks `/proc` for
-running processes that refer to an install, then delegates removals to
+The helper is deliberately Linux-only for now. It lists all installed versions,
+uses mise's tracked configuration sources to protect referenced versions, and
+checks `/proc` for running processes that refer to an install, then delegates removals to
 `mise uninstall` with `MISE_INSTALLS_DIR` pointed at the system install root.
 It does not remove files directly.
 
