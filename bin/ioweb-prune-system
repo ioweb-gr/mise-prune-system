@@ -62,10 +62,8 @@ def run_mise(mise: str, args: list[str], env: dict[str, str] | None = None) -> s
         raise PruneError(f"could not run {mise!r}: {exc}") from exc
 
 
-def list_installs(mise: str) -> dict[str, list[dict[str, object]]]:
-    # --all-sources broadens config discovery, while --installed is needed to
-    # include installed versions that are no longer requested by any config.
-    result = run_mise(mise, ["ls", "--installed", "--all-sources", "--json"])
+def list_mise_rows(mise: str, args: list[str]) -> dict[str, list[dict[str, object]]]:
+    result = run_mise(mise, args)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
         raise PruneError(f"mise ls failed with exit code {result.returncode}: {detail}")
@@ -83,6 +81,38 @@ def list_installs(mise: str) -> dict[str, list[dict[str, object]]]:
         if len(normalized[tool]) != len(rows):
             raise PruneError(f"mise ls JSON contained a malformed row for {tool}")
     return normalized
+
+
+def list_installs(mise: str) -> dict[str, list[dict[str, object]]]:
+    # `--installed` includes old, unrequested installs. `--all-sources` finds
+    # references in every config mise has seen, but omits those old installs.
+    # Merge the two results by install path so both sets of facts are retained.
+    installed = list_mise_rows(mise, ["ls", "--installed", "--json"])
+    tracked = list_mise_rows(mise, ["ls", "--all-sources", "--json"])
+    tracked_by_path: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for tool, rows in tracked.items():
+        for row in rows:
+            install_path = row.get("install_path")
+            sources = row.get("sources")
+            if isinstance(install_path, str) and isinstance(sources, list):
+                merged = tracked_by_path.setdefault((tool, install_path), [])
+                for source in sources:
+                    if source not in merged:
+                        merged.append(source)
+
+    for tool, rows in installed.items():
+        for row in rows:
+            install_path = row.get("install_path")
+            if not isinstance(install_path, str):
+                continue
+            sources = row.get("sources")
+            merged = list(sources) if isinstance(sources, list) else []
+            for source in tracked_by_path.get((tool, install_path), []):
+                if source not in merged:
+                    merged.append(source)
+            if merged:
+                row["sources"] = merged
+    return installed
 
 
 def within(path: pathlib.Path, root: pathlib.Path) -> bool:
